@@ -48,9 +48,13 @@ class RectifiedFlow:
             (x_t, x0, vel): interpolated point, noise used, and regression
                             target velocity (x1 - x0), all shape (B, *).
         """
-        # TODO (6.A) — sample x0 ~ N(0,I), form x_t, compute vel
-        # Hint: broadcast t to match x1's spatial dimensions before multiplying.
-        raise NotImplementedError
+        B = x1.shape[0]
+        x0 = torch.randn_like(x1)
+        # broadcast t: (B,) -> (B, 1, 1, 1) for image tensors
+        t_view = t.view(B, *([1] * (x1.dim() - 1)))
+        x_t = (1.0 - t_view) * x0 + t_view * x1
+        vel = x1 - x0
+        return x_t, x0, vel
 
     def loss(self, v_theta: nn.Module, x1: Tensor) -> Tensor:
         """Rectified Flow training loss (RF objective).
@@ -65,8 +69,10 @@ class RectifiedFlow:
         Returns:
             Scalar loss.
         """
-        # TODO (6.A)
-        raise NotImplementedError
+        B = x1.shape[0]
+        t = torch.rand(B, device=x1.device)       # t ~ Uniform(0, 1)
+        x_t, _, vel = self.forward_process(x1, t)
+        return F.mse_loss(v_theta(x_t, t), vel)
 
     # ------------------------------------------------------------------
     # 6.B  Euler ODE sampler
@@ -96,8 +102,17 @@ class RectifiedFlow:
         Returns:
             Generated samples X_1, shape (B, C, H, W).
         """
-        # TODO (6.B)
-        raise NotImplementedError
+        dt = 1.0 / num_steps
+        B = shape[0]
+        x = torch.randn(shape, device=device)   # X_0 ~ N(0, I)
+
+        for i in range(num_steps):
+            t_val = i * dt
+            t = torch.full((B,), t_val, device=device)
+            v = v_theta(x, t)
+            x = x + v * dt
+
+        return x
 
     # ------------------------------------------------------------------
     # 6.C  Reflow  (data generation only — retraining uses loss() above)
@@ -130,5 +145,25 @@ class RectifiedFlow:
         Returns:
             (x0_all, x1_all): tensors of shape (n_pairs, C, H, W) on CPU.
         """
-        # TODO (6.C)
-        raise NotImplementedError
+        x0_list, x1_list = [], []
+        n_done = 0
+
+        while n_done < n_pairs:
+            B = min(batch_size, n_pairs - n_done)
+            shape = (B, *image_shape)
+
+            x0 = torch.randn(shape, device=device)
+            x = x0.clone()
+
+            dt = 1.0 / num_steps
+            for i in range(num_steps):
+                t_val = i * dt
+                t = torch.full((B,), t_val, device=device)
+                v = v_theta(x, t)
+                x = x + v * dt
+
+            x0_list.append(x0.cpu())
+            x1_list.append(x.cpu())
+            n_done += B
+
+        return torch.cat(x0_list, dim=0)[:n_pairs], torch.cat(x1_list, dim=0)[:n_pairs]

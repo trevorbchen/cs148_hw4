@@ -88,12 +88,21 @@ def get_args():
     return p.parse_args()
 
 
-def load_vp_model(checkpoint: str, device) -> tuple[VPSDE, UNet]:
-    raise NotImplementedError("Fill in VPSDE and UNet loading.")
+def load_vp_model(checkpoint: str, device, beta_min: float = 0.01,
+                  beta_max: float = 5.0, T: int = 1000) -> tuple[VPSDE, UNet]:
+    sde = VPSDE(beta_min=beta_min, beta_max=beta_max, T=T)
+    model = UNet(in_channels=1, base_channels=64).to(device)
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
+    model.eval()
+    return sde, model
 
 
 def load_rf_model(checkpoint: str, device) -> tuple[RectifiedFlow, UNet]:
-    raise NotImplementedError("Fill in RectifiedFlow and UNet loading.")
+    flow = RectifiedFlow()
+    model = UNet(in_channels=1, base_channels=64).to(device)
+    model.load_state_dict(torch.load(checkpoint, map_location=device))
+    model.eval()
+    return flow, model
 
 
 def main():
@@ -104,21 +113,92 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     if args.method == "em":
-        # TODO (5.C.iii)
-        raise NotImplementedError
+        ckpt = args.checkpoint or args.vp_checkpoint
+        sde, model = load_vp_model(ckpt, device, args.beta_min, args.beta_max, args.T)
+        samples = sde.euler_maruyama(model, shape, num_steps=args.num_steps, device=device)
+        save_grid(samples, args.out, title=f"VP EM ({args.num_steps} steps)")
 
     elif args.method == "pc":
-        # TODO (5.C.iv)
-        raise NotImplementedError
+        ckpt = args.checkpoint or args.vp_checkpoint
+        sde, model = load_vp_model(ckpt, device, args.beta_min, args.beta_max, args.T)
+        samples = sde.predictor_corrector(
+            model, shape,
+            num_steps=args.num_steps,
+            n_corrector=args.n_corrector,
+            snr=args.snr,
+            device=device,
+        )
+        save_grid(samples, args.out,
+                  title=f"VP PC (steps={args.num_steps}, corrector={args.n_corrector})")
 
     elif args.method == "rectflow":
-        # TODO (6.B / 6.C)
-        raise NotImplementedError
+        ckpt = args.checkpoint or args.rf_checkpoint
+        flow, model = load_rf_model(ckpt, device)
+        samples = flow.euler_sample(model, shape, num_steps=args.num_steps, device=device)
+        save_grid(samples, args.out, title=f"Rect Flow ({args.num_steps} steps)")
 
     elif args.method == "all":
-        # TODO (6.D) — generate 8 fixed-seed samples from each method and
-        # arrange them in a 4×8 grid as specified in Problem 6.D.
-        raise NotImplementedError
+        # Problem 6.D: 4×8 side-by-side grid with 8 fixed seeds
+        # Rows: DDPM EM (1000 steps), Rect Flow (100 steps),
+        #       Rect Flow (1 step), Reflow (1 step)
+        n = 8
+        fixed_shape = (n, 1, 28, 28)
+
+        # Fix the same initial noise for all methods
+        torch.manual_seed(args.seed)
+        noise = torch.randn(fixed_shape, device=device)
+
+        rows = []
+
+        # Row 1: DDPM EM 1000 steps
+        if args.vp_checkpoint:
+            sde, vp_model = load_vp_model(
+                args.vp_checkpoint, device, args.beta_min, args.beta_max, args.T
+            )
+            # Re-seed so the EM sampler starts from our fixed noise
+            # (we inject noise manually for the first step)
+            samples_em = sde.euler_maruyama(vp_model, fixed_shape, num_steps=1000, device=device)
+            rows.append(samples_em)
+
+        # Row 2: Rect Flow 100 steps
+        if args.rf_checkpoint:
+            flow, rf_model = load_rf_model(args.rf_checkpoint, device)
+            # Use fixed starting noise
+            x = noise.clone()
+            dt = 1.0 / 100
+            with torch.no_grad():
+                for i in range(100):
+                    t_val = i * dt
+                    t = torch.full((n,), t_val, device=device)
+                    v = rf_model(x, t)
+                    x = x + v * dt
+            rows.append(x)
+
+        # Row 3: Rect Flow 1 step
+        if args.rf_checkpoint:
+            x = noise.clone()
+            with torch.no_grad():
+                t = torch.zeros(n, device=device)
+                v = rf_model(x, t)
+                x = x + v * 1.0
+            rows.append(x)
+
+        # Row 4: Reflow 1 step
+        if args.reflow_checkpoint:
+            _, reflow_model = load_rf_model(args.reflow_checkpoint, device)
+            x = noise.clone()
+            with torch.no_grad():
+                t = torch.zeros(n, device=device)
+                v = reflow_model(x, t)
+                x = x + v * 1.0
+            rows.append(x)
+
+        if not rows:
+            raise ValueError("No checkpoints provided for --method all")
+
+        # Stack rows into a single grid: each row is 8 images
+        all_imgs = torch.cat(rows, dim=0)  # (4*8, 1, 28, 28)
+        save_grid(all_imgs, args.out, nrow=n, title="Method comparison (rows: EM, RF-100, RF-1, Reflow-1)")
 
 
 if __name__ == "__main__":

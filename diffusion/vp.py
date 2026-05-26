@@ -12,6 +12,8 @@ are complete and should not be modified.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -51,8 +53,7 @@ class VPSDE:
 
         Reference: Eq. (32) of Song21.
         """
-        # TODO (5.A.ii)
-        raise NotImplementedError
+        return self.beta_min + (self.beta_max - self.beta_min) * t
 
     def c(self, t: Tensor) -> Tensor:
         """c(t) = exp(-½ ∫_0^t β(s) ds) — the signal decay factor.
@@ -68,8 +69,8 @@ class VPSDE:
 
         Reference: Eq. (33) of Song21.
         """
-        # TODO (5.A.ii)
-        raise NotImplementedError
+        integral = self.beta_min * t + 0.5 * (self.beta_max - self.beta_min) * t ** 2
+        return torch.exp(-0.5 * integral)
 
     def sigma(self, t: Tensor) -> Tensor:
         """σ(t) = √(1 - c(t)²) — the noise standard deviation.
@@ -80,8 +81,7 @@ class VPSDE:
         Returns:
             σ(t), same shape as t.
         """
-        # TODO (5.A.iii)
-        raise NotImplementedError
+        return torch.sqrt(torch.clamp(1.0 - self.c(t) ** 2, min=1e-10))
 
     def drift(self, x: Tensor, t: Tensor) -> Tensor:
         """Drift coefficient  f(x, t) = -½ β(t) x.
@@ -93,8 +93,10 @@ class VPSDE:
         Returns:
             Drift f(x, t), same shape as x.
         """
-        # TODO (5.A.i)
-        raise NotImplementedError
+        b = self.beta(t)
+        for _ in range(x.dim() - 1):
+            b = b.unsqueeze(-1)
+        return -0.5 * b * x
 
     def diffusion(self, t: Tensor) -> Tensor:
         """Diffusion coefficient  g(t) = √β(t).
@@ -105,8 +107,7 @@ class VPSDE:
         Returns:
             g(t), same shape as t.
         """
-        # TODO (5.A.i)
-        raise NotImplementedError
+        return torch.sqrt(self.beta(t))
 
     def marginal(self, x0: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
         """Sample from the forward marginal  q(x_t | x_0).
@@ -121,8 +122,15 @@ class VPSDE:
         Returns:
             (x_t, eps): noised sample and the noise used, both shape (B, *).
         """
-        # TODO (5.A.iii)
-        raise NotImplementedError
+        ct = self.c(t)
+        st = self.sigma(t)
+        # broadcast (B,) -> (B, 1, 1, 1) for spatial dims
+        for _ in range(x0.dim() - 1):
+            ct = ct.unsqueeze(-1)
+            st = st.unsqueeze(-1)
+        eps = torch.randn_like(x0)
+        x_t = ct * x0 + st * eps
+        return x_t, eps
 
     # ------------------------------------------------------------------
     # 5.B  Samplers
@@ -141,6 +149,9 @@ class VPSDE:
         Starting from x(T=1) ~ N(0, σ(1)² I), integrates the reverse VP-SDE:
             dx = [-½ β(t) x - β(t) ∇_x log p_t(x)] dt + √β(t) dB̄_t
 
+        The score model is trained with epsilon prediction:
+            score = -eps_theta(x, t) / σ(t)
+
         Args:
             score_model: Trained score network s_θ(x, t).
                          Called as `score_model(x, t)` where t is a float
@@ -153,10 +164,32 @@ class VPSDE:
             Generated samples, shape (B, C, H, W), values in [-1, 1].
         """
         num_steps = num_steps or self.T
-        # TODO (5.B.i) — implement the EM sampler
-        # Hint: time runs from t=1 down to t≈0 in steps of Δt = 1/num_steps.
-        #       At t=1, initialise x ~ N(0, σ(1)² I).
-        raise NotImplementedError
+        dt = 1.0 / num_steps
+        B = shape[0]
+
+        # Initialise x(1) ~ N(0, σ(1)² I)
+        t1 = torch.ones(B, device=device)
+        sigma1 = self.sigma(t1).view(B, *([1] * (len(shape) - 1)))
+        x = sigma1 * torch.randn(shape, device=device)
+
+        # Reverse from t=1 down to t=dt (skip t=0)
+        for i in range(num_steps):
+            t_val = 1.0 - i * dt
+            t = torch.full((B,), t_val, device=device)
+
+            beta_t = self.beta(t).view(B, *([1] * (len(shape) - 1)))
+            sigma_t = self.sigma(t).view(B, *([1] * (len(shape) - 1)))
+
+            # Model predicts eps; convert to score: s = -eps / sigma
+            eps_pred = score_model(x, t)
+            score = -eps_pred / (sigma_t + 1e-6)
+
+            # Reverse drift: -f(x,t) + g²*score = ½β*x + β*score
+            drift = 0.5 * beta_t * x + beta_t * score
+            z = torch.randn_like(x)
+            x = x + drift * dt + torch.sqrt(beta_t) * math.sqrt(dt) * z
+
+        return x.clamp(-1.0, 1.0)
 
     @torch.no_grad()
     def predictor_corrector(
@@ -185,8 +218,48 @@ class VPSDE:
             Generated samples, shape (B, C, H, W), values in [-1, 1].
         """
         num_steps = num_steps or self.T
-        # TODO (5.B.ii)
-        raise NotImplementedError
+        dt = 1.0 / num_steps
+        B = shape[0]
+        ndim_extra = len(shape) - 1  # spatial dims beyond batch
+
+        # Initialise x(1) ~ N(0, σ(1)² I)
+        t1 = torch.ones(B, device=device)
+        sigma1 = self.sigma(t1).view(B, *([1] * ndim_extra))
+        x = sigma1 * torch.randn(shape, device=device)
+
+        for i in range(num_steps):
+            t_val = 1.0 - i * dt
+            t_next_val = max(t_val - dt, 1e-5)
+            t = torch.full((B,), t_val, device=device)
+            t_next = torch.full((B,), t_next_val, device=device)
+
+            beta_t = self.beta(t).view(B, *([1] * ndim_extra))
+            sigma_t = self.sigma(t).view(B, *([1] * ndim_extra))
+
+            # --- Predictor: Euler-Maruyama step ---
+            eps_pred = score_model(x, t)
+            score = -eps_pred / (sigma_t + 1e-6)
+            drift = 0.5 * beta_t * x + beta_t * score
+            z = torch.randn_like(x)
+            x = x + drift * dt + torch.sqrt(beta_t) * math.sqrt(dt) * z
+
+            # --- Corrector: annealed Langevin dynamics (Algorithm 5 of Song21) ---
+            if n_corrector > 0:
+                sigma_next = self.sigma(t_next).view(B, *([1] * ndim_extra))
+                for _ in range(n_corrector):
+                    eps_c = score_model(x, t_next)
+                    score_c = -eps_c / (sigma_next + 1e-6)
+
+                    # Step size: ε = (snr * ||z|| / ||score_c||)²  (per sample)
+                    z = torch.randn_like(x)
+                    score_norm = score_c.view(B, -1).norm(dim=1)
+                    z_norm = z.view(B, -1).norm(dim=1)
+                    alpha = ((snr * z_norm) / (score_norm + 1e-8)) ** 2
+                    alpha = alpha.view(B, *([1] * ndim_extra))
+
+                    x = x + alpha * score_c + torch.sqrt(2.0 * alpha) * z
+
+        return x.clamp(-1.0, 1.0)
 
     # ------------------------------------------------------------------
     # 5.D  Inverse problems (EC)
@@ -223,5 +296,37 @@ class VPSDE:
             Reconstructed images, shape (B, C, H, W).
         """
         num_steps = num_steps or self.T
-        # TODO (EC 5.D)
-        raise NotImplementedError
+        dt = 1.0 / num_steps
+        B = corrupted.shape[0]
+        shape = corrupted.shape
+        ndim_extra = len(shape) - 1
+
+        corrupted = corrupted.to(device)
+        mask = mask.to(device)
+
+        # Initialise from noise
+        t1 = torch.ones(B, device=device)
+        sigma1 = self.sigma(t1).view(B, *([1] * ndim_extra))
+        x = sigma1 * torch.randn(shape, device=device)
+
+        for i in range(num_steps):
+            t_val = 1.0 - i * dt
+            t = torch.full((B,), t_val, device=device)
+
+            beta_t = self.beta(t).view(B, *([1] * ndim_extra))
+            sigma_t = self.sigma(t).view(B, *([1] * ndim_extra))
+            c_t = self.c(t).view(B, *([1] * ndim_extra))
+
+            # For known pixels: replace x with forward-diffused ground truth
+            eps_known = torch.randn_like(corrupted)
+            x_known = c_t * corrupted + sigma_t * eps_known
+            x = mask * x_known + (1 - mask) * x
+
+            # Reverse SDE step
+            eps_pred = score_model(x, t)
+            score = -eps_pred / (sigma_t + 1e-6)
+            drift = 0.5 * beta_t * x + beta_t * score
+            z = torch.randn_like(x)
+            x = x + drift * dt + torch.sqrt(beta_t) * math.sqrt(dt) * z
+
+        return x.clamp(-1.0, 1.0)
